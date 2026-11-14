@@ -128,11 +128,14 @@ def point_ground(frame, elev, key=None):
         out = memo.get(keys)
         miss = np.flatnonzero(np.isnan(out))
         if len(miss):
-            z = look(keys[miss] / 100.0)        # (at the key's own point, as grade_plans' ground)
+            import revisit
+            with revisit.scope() as b:
+                z = look(keys[miss] / 100.0)    # (at the key's own point, as grade_plans' ground)
             out[miss] = z
-            if len(memo) + len(miss) > GROUND_MEMO_MAX:
-                memo.clear()
-            memo.put(np.ascontiguousarray(keys[miss]), np.ascontiguousarray(z, np.float64))
+            if b.complete:                      # (a short read's heights not kept: asked again, read and faulted anew)
+                if len(memo) + len(miss) > GROUND_MEMO_MAX:
+                    memo.clear()
+                memo.put(np.ascontiguousarray(keys[miss]), np.ascontiguousarray(z, np.float64))
         return out
     return ground
 

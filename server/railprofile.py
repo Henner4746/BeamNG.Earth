@@ -20,6 +20,7 @@ import numpy as np
 
 import fast
 import railways
+import revisit
 import roads
 
 ENABLED = os.environ.get("BNE_RAIL_PROFILE", "on") not in ("off", "0", "false")
@@ -37,7 +38,8 @@ NODE_MEMO_POINTS = 3_000_000        # points kept in the nodes (~16 bytes a poin
                                     # let go. A node is pure in (anchor, node) since its ground is the DEM's (the deck
                                     # ground order-free: grading._deck_ground), so the number kept no longer changes a
                                     # bed. 48 nodes were fewer than one tile asks (a whole viaduct's nodes): Berlin-Mitte,
-                                    # 25 tiles: 290 nodes made 3579 times, ~3 of a tile's ~5 s
+                                    # 25 tiles: 290 nodes made 3579 times, ~3 of a tile's ~5 s. Only a node made on a
+                                    # complete read is kept (_node: a short DEM's node would outlive its build's rebuild)
 _NODES = OrderedDict()              # (anchor key, ix, iy) -> {(fid, kind): (packed keys, heights)}
 _NODES_LOCK = threading.Lock()      # (road tiles are built on several threads)
 _NODES_PTS = [0]
@@ -143,6 +145,24 @@ def _node(frame, akey, load, ground, ix, iy):
         if got is not None:
             _NODES.move_to_end(ck)
             return got
+    with revisit.scope() as b:      # (its own reads' faults: this thread's, its pool tasks', the process's)
+        out = _make_node(frame, load, ground, ix, iy)
+    if not b.complete:              # read short (a lidar sheet not there yet, the lidar rule): not kept, so the build
+        return out                  # made again on the full DEM makes the node again too, and reads (and faults) anew
+    with _NODES_LOCK:
+        if ck in _NODES:            # (made meanwhile on another thread: the same node)
+            return _NODES[ck]
+        if not _NODES:              # (cleared from outside: the tests)
+            _NODES_PTS[0] = 0
+        _NODES[ck] = out
+        _NODES_PTS[0] += sum(len(k) for k, _z in out.values())
+        while _NODES_PTS[0] > NODE_MEMO_POINTS and len(_NODES) > 1:
+            _NODES_PTS[0] -= sum(len(k) for k, _z in _NODES.popitem(last=False)[1].values())
+    return out
+
+
+def _make_node(frame, load, ground, ix, iy):
+    """_node's node (ix, iy), made (not looked up)."""
     cx, cy = ix * NODE_M, iy * NODE_M
     box = (cx - NODE_M, cy - NODE_M, cx + NODE_M, cy + NODE_M)
     reach = MARGIN_M
@@ -170,15 +190,6 @@ def _node(frame, akey, load, ground, ix, iy):
             v = np.concatenate([z[off[n]:off[n + 1]] for n in ns])
             uk, first = np.unique(k[::-1], return_index=True)     # (the last of equal keys, as a dict's update)
             out[fk] = (uk, v[::-1][first])
-    with _NODES_LOCK:
-        if ck in _NODES:            # (made meanwhile on another thread: the same node)
-            return _NODES[ck]
-        if not _NODES:              # (cleared from outside: the tests)
-            _NODES_PTS[0] = 0
-        _NODES[ck] = out
-        _NODES_PTS[0] += sum(len(k) for k, _z in out.values())
-        while _NODES_PTS[0] > NODE_MEMO_POINTS and len(_NODES) > 1:
-            _NODES_PTS[0] -= sum(len(k) for k, _z in _NODES.popitem(last=False)[1].values())
     return out
 
 
