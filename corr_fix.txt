@@ -1,0 +1,17 @@
+m/out-fix-trey/railcol_*.cdae vertices in corridor: 313
+  s   38-  40  lowest 220.90
+  s   40-  42  lowest 220.90
+  s   42-  44  lowest 220.90
+  s   44-  46  lowest 220.89
+  s   46-  48  lowest 220.73
+  s   48-  50  lowest 220.75
+  s   50-  52  lowest 220.77
+  s   52-  54  lowest 220.79
+  s   54-  56  lowest 220.76
+  s   56-  58  lowest 220.77
+  s   58-  60  lowest 220.79
+  s   60-  62  lowest 220.80
+  s   62-  64  lowest 220.82
+  s   64-  66  lowest 220.82
+  s   66-  68  lowest 220.83
+  s   68-  70  lowest 220.85
