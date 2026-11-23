@@ -44,6 +44,7 @@ from collections import OrderedDict
 
 import numpy as np
 
+import dedom
 import fast
 import mapcells
 
@@ -54,6 +55,7 @@ VERSION = 3                 # (2: the lidar cells carry the ground stretches fou
 NATIVE = 102                # earthfast.VERSION of the kernels below
 ON = os.environ.get("BNE_ROADZ", "on") != "off"
 LIDAR_ON = os.environ.get("BNE_LIDAR_DECKS", "on") != "off"
+DE_ON = os.environ.get("BNE_DE_DECKS", "on") != "off"    # Germany's surface-model decks (dedom.py)
 LIDAR_INDEX_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "usgs3dep_index.json.gz")
 PROVIDER = None             # the server's RoadZ (MapData makes it): BridgeProfiles / Grader ask it
 
@@ -172,8 +174,8 @@ def sources_at(lat, lon, lidar=None):
         out.append("ign")
     if _in(NO_BOUNDS, lat, lon):
         out.append("nvdb")
-    if lidar and any(_in(b, lat, lon) for b in US_BOUNDS):
-        out.append("lidar")
+    if lidar and (any(_in(b, lat, lon) for b in US_BOUNDS) or (DE_ON and dedom.service_at(lat, lon) is not None)):
+        out.append("lidar")     # (in Germany: a state's open surface model instead of a point cloud, dedom.py)
     return out
 
 
@@ -722,6 +724,10 @@ class RoadZ:
 
     def _lidar(self, key):
         import geodesy
+        lat_c, lon_c = key.center()
+        svc = dedom.service_at(lat_c, lon_c) if DE_ON else None
+        if svc is not None:
+            return self._dedom(key, svc)
         parts = self._bridges(key)
         cands = self._gap_candidates(key)
         if not parts and not cands:
@@ -746,6 +752,78 @@ class RoadZ:
             if got is not None:
                 return got
         return Lines.build([], corrected=True)
+
+    def _dedom(self, key, svc):
+        """The cell's decks (and their stretches and approaches, as _lidar_from) measured on a German state's surface
+        model: the dedom shards' samples round the cell (made offline along every bridge, tools/build_de_decks.py) are
+        the points (class 1), their DGM heights the datum onto our DEM. No samples (outside the state, no bridge, no
+        shard yet): none, the inference stands."""
+        import geodesy
+        parts = self._bridges(key)
+        cands = self._gap_candidates(key)
+        empty = Lines.build([], corrected=True)
+        empty.gaps = []
+        if not parts:
+            return empty
+        lat_c, lon_c = key.center()
+        frame = geodesy.EnuFrame(lat_c, lon_c)
+        nb = len(parts)
+        parts = parts + [(ring, half) for _fid, ring, half in cands]
+        local = []
+        for ring, half in parts:
+            e, n, _ = frame.geodetic_to_enu(ring[:, 1], ring[:, 0], 0.0)
+            local.append((np.stack([np.asarray(e), np.asarray(n)], 1), half))
+        allr = np.concatenate([ring for ring, _h in parts])
+        pad = 60.0 / 111320.0
+        padx = pad / max(0.2, math.cos(math.radians(lat_c)))
+        la, lo, dom, dgm = dedom.points(lambda u: self._fetch(u, lane="dedom"), float(allr[:, 1].min()) - pad,
+                                        float(allr[:, 0].min()) - padx, float(allr[:, 1].max()) + pad,
+                                        float(allr[:, 0].max()) + padx)
+        ok = np.isfinite(dom)
+        if ok.sum() < DATUM_MIN_PTS:
+            return empty
+        gi = np.flatnonzero(np.isfinite(dgm))
+        if len(gi) > 4000:
+            gi = gi[:: int(math.ceil(len(gi) / 4000))]
+        fit = datum_fit(dgm[gi], self._dem_raw(la[gi], lo[gi])) if len(gi) else None
+        if fit is None or fit[0] != 1.0:
+            log.debug("roadz dedom %s %s: no datum fit (%d ground samples)", svc["name"], key, len(gi))
+            return empty
+        off = fit[1]
+        e, n, _ = frame.geodetic_to_enu(la[ok], lo[ok], 0.0)
+        pts = np.ascontiguousarray(np.stack([np.asarray(e), np.asarray(n), dom[ok] - off], 1))
+        cls = np.ascontiguousarray(np.ones(int(ok.sum()), np.uint8))
+        fast.require(GAP_NATIVE, "roadz surface-model decks")
+        rows, gaps = self._measure(frame, parts, local, nb, [c[0] for c in cands], pts, cls)
+        log.debug("roadz dedom %s %s: %d decks, %d samples, datum %.2f, %d rows, %d stretches", svc["name"], key, nb,
+                  len(pts), off, len(rows), len(gaps))
+        got = Lines.build(rows, corrected=True)
+        got.gaps = gaps
+        return got
+
+    def dedom_samples(self, key, svc, box_m=250.0, sample=None):
+        """(lat, lon, dom, dgm) of the cell's bridges sampled on the state's services (tools/build_de_decks.py: the
+        build machine's side, never the game's): each deck and its candidate stretches on dedom's 1 m grid across its
+        width plus LIDAR_PAD_M, in requests of at most box_m (or read by sample(lat, lon) -> (dom, dgm))."""
+        import geodesy
+        parts = self._bridges(key)
+        if not parts:
+            return tuple(np.zeros(0) for _ in range(4))
+        parts = parts + [(ring, half) for _fid, ring, half in self._gap_candidates(key)]
+        lat_c, lon_c = key.center()
+        frame = geodesy.EnuFrame(lat_c, lon_c)
+        grid = []
+        for ring, half in parts:
+            e, n, _ = frame.geodetic_to_enu(ring[:, 1], ring[:, 0], 0.0)
+            grid.append(dedom.grid_along(np.stack([np.asarray(e), np.asarray(n)], 1), half + LIDAR_PAD_M))
+        g = np.concatenate(grid)
+        la, lo, _ = frame.enu_to_geodetic(g[:, 0], g[:, 1], 0.0)
+        la, lo = np.asarray(la, np.float64), np.asarray(lo, np.float64)
+        if sample is not None:          # (a state's tiles, tools/de_dom_tiles.py)
+            dom, dgm = sample(la, lo)
+        else:
+            dom, dgm = dedom.sample(lambda u: self._fetch(u, lane="dedom"), svc, la, lo, box_m)
+        return la, lo, dom, dgm
 
     def _boxes(self, frame, parts, local):
         """EPT boxes (Mercator) along parts: one per BOX_STEP_M of each line, padded by its half width."""
